@@ -53,6 +53,8 @@ Pipeline quality controls:
   artifact.
 - The collector merges continuation pages into the prior real item when a
   product spans multiple pages.
+- Malformed source JSON repairs are checked for item loss; if a repair drops
+  named items, the page is retried once with OCR context.
 - The enrichment pass retries transient Gemini timeouts per item before marking
   an enrichment error.
 - The expensive stages support `--workers`: rendering and OCR run pages

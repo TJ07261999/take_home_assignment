@@ -69,6 +69,8 @@ continuation/error-sensitive pages sequentially with previous-page context
 before collection. Enrichment is also parallel because each item can be tagged
 independently. If the Gemini API returns temporary 429/503 rate-limit errors,
 rerun the failed stage with `--workers 8` or `--workers 4`.
+If Gemini returns malformed source JSON, the repair step rejects repairs that
+drop named items and retries that page once with OCR context.
 
 Validate the generated artifacts and loaded Postgres tables:
 

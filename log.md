@@ -46,5 +46,8 @@
   first pass plus sequential context repair for continuation/error-sensitive
   pages, and enrichment tags independent items in parallel. The fast run uses
   16 workers.
+- Tightened source JSON repair so malformed Gemini page responses cannot be
+  repaired into empty item lists when the raw response contains named items;
+  those pages retry once with OCR context.
 - Final validated run loaded 39 page records, 80 magic items, and 0 errors into
   local Postgres.

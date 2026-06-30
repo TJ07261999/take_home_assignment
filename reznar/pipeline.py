@@ -663,6 +663,10 @@ OCR helper text for page {page_number}:
 def build_repair_prompt(raw_json_text: str, error: str, schema_name: str) -> str:
     return f"""Repair the JSON so it validates as {schema_name}. Return JSON only.
 
+Preserve all item objects, item names, and source facts from the broken JSON.
+Do not simplify the response by returning only page_number or an empty items
+array when the broken JSON contains item names.
+
 Validation error:
 {error}
 
@@ -671,8 +675,43 @@ Broken JSON:
 """
 
 
+def count_raw_item_names(text: str) -> int:
+    return len(re.findall(r'"name"\s*:', text))
+
+
+def ensure_source_repair_not_lossy(raw_text: str, extraction: CatalogPageExtraction) -> None:
+    raw_item_count = count_raw_item_names(raw_text)
+    if raw_item_count and len(extraction.items) < raw_item_count:
+        raise ValueError(
+            "source extraction repair dropped item records: "
+            f"raw response mentions {raw_item_count} item name(s), "
+            f"validated extraction has {len(extraction.items)}"
+        )
+
+
 def is_recitation_stop(exc: Exception) -> bool:
     return "RECITATION" in repr(exc)
+
+
+def validate_source_response(
+    parsed: Any,
+    raw_response: dict[str, Any],
+    client: GeminiClient,
+) -> tuple[CatalogPageExtraction, dict[str, Any]]:
+    raw_text = extract_gemini_text(raw_response)
+    repair_record: dict[str, Any] = {}
+    try:
+        extraction = CatalogPageExtraction.model_validate(parsed)
+    except ValidationError as exc:
+        repaired, repair_raw = client.generate_json(
+            build_repair_prompt(raw_text, str(exc), "CatalogPageExtraction")
+        )
+        extraction = CatalogPageExtraction.model_validate(repaired)
+        repair_record["repair_raw_response"] = repair_raw
+        repair_record["repaired_json"] = repaired
+
+    ensure_source_repair_not_lossy(raw_text, extraction)
+    return extraction, repair_record
 
 
 def extract_one_page(
@@ -727,16 +766,21 @@ def extract_one_page(
             )
             record["recitation_retry_used"] = True
         try:
-            extraction = CatalogPageExtraction.model_validate(parsed)
-        except ValidationError as exc:
-            repaired, repair_raw = client.generate_json(
-                build_repair_prompt(
-                    json.dumps(parsed, indent=2), str(exc), "CatalogPageExtraction"
-                )
+            extraction, repair_record = validate_source_response(parsed, raw_response, client)
+            record.update(repair_record)
+        except ValueError as exc:
+            if ocr_text or not ocr_path.exists():
+                raise
+            record["ocr_context_retry_error"] = repr(exc)
+            retry_ocr_text = ocr_path.read_text(encoding="utf-8")
+            parsed, raw_response = client.generate_json(
+                build_source_prompt(page, retry_ocr_text, context),
+                image_path=image_path,
             )
-            extraction = CatalogPageExtraction.model_validate(repaired)
-            record["repair_raw_response"] = repair_raw
-            record["repaired_json"] = repaired
+            extraction, repair_record = validate_source_response(parsed, raw_response, client)
+            record.update(repair_record)
+            record["ocr_context_retry_used"] = True
+            record["ocr_context_used"] = True
 
         for item in extraction.items:
             item.source_pages = [page]
