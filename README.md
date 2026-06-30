@@ -10,6 +10,54 @@
 
 MulhollandAI has taken on Reznar's Arcane Oddities, a fantasy magic item shop, as a client. Your job is to help Reznar organize their products so that it is easy to add new items for sale and to find patterns across the catalog.
 
+## Part 1 Implementation
+
+This branch implements Part 1: ontology design plus a PDF-to-Postgres
+extraction pipeline.
+
+The Part 1 pipeline lives in `reznar/pipeline.py`; the ontology models live in
+`reznar/ontology.py`. See `RUN.md` for end-to-end run instructions and
+`log.md` for a timestamped implementation note.
+
+At a high level:
+
+```text
+PDF -> page PNGs -> OCR provenance text -> Gemini VLM source extraction
+-> Pydantic validation -> Gemini LLM semantic tags -> Postgres
+```
+
+The PDF is image-based, so the pipeline uses Gemini vision as the primary
+extractor. Tesseract OCR is retained as full page-level provenance for
+debugging, fallback, and auditability. Item descriptions are concise mechanics
+summaries, while the original generated OCR text is stored on page records.
+
+Ontology design choices:
+
+- `ExtractionPage` preserves page-level provenance: rendered image path, OCR
+  text, raw VLM JSON, extraction status, and warnings.
+- `SourceMagicItem` stores catalog facts read from the PDF: item name, printed
+  type line, item kind, rarity, attunement, curse flag, source pages,
+  continuation flags, confidence, and a concise mechanics summary.
+- `MagicItem` is the final searchable catalog entity. It extends
+  `SourceMagicItem` with a stable ID and derived `ItemMechanics`.
+- `ItemMechanics` captures Reznar's query dimensions: equipment slots, bonuses,
+  damage types, defenses, granted spells, inflicted conditions, target
+  creatures, environment tags, usage limits, action economy, and notes.
+- `source_pages` links each item back to `ExtractionPage`, so the structured
+  ontology can be audited against the original PDF-derived page artifacts.
+
+Pipeline quality controls:
+
+- Pydantic validates both source extraction and enriched ontology records.
+- Gemini extraction failures do not overwrite a previous successful page
+  artifact.
+- The collector merges continuation pages into the prior real item when a
+  product spans multiple pages.
+- The enrichment pass retries transient Gemini timeouts per item before marking
+  an enrichment error.
+- `uv run python -m reznar.pipeline validate --work-dir data/extracted_fresh`
+  checks generated artifacts and Postgres consistency.
+
 ---
 
 ## What Reznar can tell you about magic items

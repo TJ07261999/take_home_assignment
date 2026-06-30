@@ -2,9 +2,17 @@ __pycache__/
 *.py[cod]
 .DS_Store
 .venv/
-uv.lock
+
+# Local secrets
+.env
+.env.*
+!.env.example
 
 # Embedded Postgres data directory created by db.connect()
 data/.pg/
+
+# Generated extraction artifacts. Rebuild these from data/items_combined.pdf.
+data/extracted/
+data/extracted_fresh/
 
 *.egg-info/
