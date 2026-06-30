@@ -54,13 +54,18 @@ postgres is ready
 For a clean exam-style run from the PDF into a fresh artifact directory:
 
 ```bash
-uv run python -m reznar.pipeline all --pdf data/items_combined.pdf --work-dir data/extracted_fresh --force --no-ocr-context --model gemini-2.5-flash --sleep 10
+uv run python -m reznar.pipeline all --pdf data/items_combined.pdf --work-dir data/extracted_fresh --force --no-ocr-context --model gemini-2.5-flash --workers 16 --sleep 0
 ```
 
 This single command renders all 39 PDF pages, runs OCR for page-level
 provenance, extracts structured item records with Gemini vision, validates and
 collects source items, enriches semantic mechanics tags, loads Postgres, writes
 CSV/SQL exports, and prints a summary.
+
+`--workers 16` parallelizes the independent enrichment pass. Page extraction
+stays sequential so multi-page items can still use previous-page context. If the
+Gemini API returns temporary 429/503 rate-limit errors, rerun the failed stage
+with `--workers 8` or `--workers 4`.
 
 Validate the generated artifacts and loaded Postgres tables:
 
@@ -137,6 +142,12 @@ If running stages manually, enrich semantic tags and load Postgres:
 uv run python -m reznar.pipeline enrich --work-dir data/extracted_fresh --sleep 10
 uv run python -m reznar.pipeline load --work-dir data/extracted_fresh
 uv run python -m reznar.pipeline export --work-dir data/extracted_fresh
+```
+
+For a faster enrichment rerun, use:
+
+```bash
+uv run python -m reznar.pipeline enrich --work-dir data/extracted_fresh --force --workers 16 --sleep 0
 ```
 
 The enrichment stage automatically retries transient Gemini timeouts for each

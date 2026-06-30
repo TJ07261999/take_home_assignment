@@ -28,6 +28,7 @@ import time
 import urllib.error
 import urllib.request
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -860,12 +861,59 @@ def ensure_no_source_page_errors(paths: Paths) -> None:
     )
 
 
+def enrich_one_item(
+    source: SourceMagicItem,
+    client: GeminiClient,
+    sleep_seconds: float,
+) -> tuple[MagicItem, dict[str, Any] | None]:
+    last_error: Exception | None = None
+    for attempt in range(1, ENRICH_ITEM_ATTEMPTS + 1):
+        try:
+            parsed, raw_response = client.generate_json(build_mechanics_prompt(source))
+            try:
+                mechanics = ItemMechanics.model_validate(parsed)
+            except ValidationError as exc:
+                repaired, repair_raw = client.generate_json(
+                    build_repair_prompt(
+                        json.dumps(parsed, indent=2), str(exc), "ItemMechanics"
+                    )
+                )
+                mechanics = ItemMechanics.model_validate(repaired)
+                raw_response = {"original": raw_response, "repair": repair_raw}
+            item_data = source.model_dump(mode="json")
+            item_data["id"] = str(uuid5(NAMESPACE_URL, f"reznar:{normalized_name(source.name)}"))
+            item_data["mechanics"] = mechanics.model_dump(mode="json")
+            return MagicItem.model_validate(item_data), None
+        except Exception as exc:  # noqa: BLE001
+            last_error = exc
+            if attempt == ENRICH_ITEM_ATTEMPTS:
+                break
+            print(
+                "enrich: retrying "
+                f"{source.name} after error on attempt {attempt}: {exc!r}"
+            )
+            time.sleep(max(sleep_seconds, 5.0))
+
+    error = {
+        "id": str(uuid4()),
+        "item_name": source.name,
+        "error_type": "enrichment_error",
+        "message": repr(last_error),
+        "raw_payload": source.model_dump(mode="json"),
+    }
+    item_data = source.model_dump(mode="json")
+    item_data["id"] = str(uuid5(NAMESPACE_URL, f"reznar:{normalized_name(source.name)}"))
+    item_data["mechanics"] = ItemMechanics().model_dump(mode="json")
+    return MagicItem.model_validate(item_data), error
+
+
 def enrich_items(
     paths: Paths,
     client: GeminiClient,
     limit: int | None,
     force: bool,
     sleep_seconds: float,
+    workers: int,
 ) -> list[MagicItem]:
     ensure_no_source_page_errors(paths)
     if paths.enriched_items.exists() and not force:
@@ -877,57 +925,51 @@ def enrich_items(
     if limit is not None:
         source_items = source_items[:limit]
 
+    workers = max(1, workers)
     enriched: list[MagicItem] = []
     errors: list[dict[str, Any]] = []
-    for index, source in enumerate(source_items, start=1):
-        print(f"enrich: {index}/{len(source_items)} {source.name}")
-        last_error: Exception | None = None
-        for attempt in range(1, ENRICH_ITEM_ATTEMPTS + 1):
-            try:
-                parsed, raw_response = client.generate_json(build_mechanics_prompt(source))
-                try:
-                    mechanics = ItemMechanics.model_validate(parsed)
-                except ValidationError as exc:
-                    repaired, repair_raw = client.generate_json(
-                        build_repair_prompt(
-                            json.dumps(parsed, indent=2), str(exc), "ItemMechanics"
-                        )
-                    )
-                    mechanics = ItemMechanics.model_validate(repaired)
-                    raw_response = {"original": raw_response, "repair": repair_raw}
-                item_data = source.model_dump(mode="json")
-                item_data["id"] = str(uuid5(NAMESPACE_URL, f"reznar:{normalized_name(source.name)}"))
-                item_data["mechanics"] = mechanics.model_dump(mode="json")
-                item = MagicItem.model_validate(item_data)
-                enriched.append(item)
-                last_error = None
-                break
-            except Exception as exc:  # noqa: BLE001
-                last_error = exc
-                if attempt == ENRICH_ITEM_ATTEMPTS:
-                    break
-                print(
-                    "enrich: retrying "
-                    f"{source.name} after error on attempt {attempt}: {exc!r}"
-                )
-                time.sleep(max(sleep_seconds, 5.0))
 
-        if last_error is not None:
-            errors.append(
-                {
-                    "id": str(uuid4()),
-                    "item_name": source.name,
-                    "error_type": "enrichment_error",
-                    "message": repr(last_error),
-                    "raw_payload": source.model_dump(mode="json"),
-                }
-            )
-            item_data = source.model_dump(mode="json")
-            item_data["id"] = str(uuid5(NAMESPACE_URL, f"reznar:{normalized_name(source.name)}"))
-            item_data["mechanics"] = ItemMechanics().model_dump(mode="json")
-            enriched.append(MagicItem.model_validate(item_data))
-        if sleep_seconds:
-            time.sleep(sleep_seconds)
+    if workers == 1:
+        for index, source in enumerate(source_items, start=1):
+            print(f"enrich: {index}/{len(source_items)} {source.name}")
+            item, error = enrich_one_item(source, client, sleep_seconds)
+            enriched.append(item)
+            if error is not None:
+                errors.append(error)
+            if sleep_seconds:
+                time.sleep(sleep_seconds)
+    else:
+        print(f"enrich: processing {len(source_items)} items with {workers} workers")
+        enriched_by_index: list[MagicItem | None] = [None] * len(source_items)
+        max_workers = min(workers, len(source_items)) if source_items else 1
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {
+                executor.submit(enrich_one_item, source, client, sleep_seconds): (index, source)
+                for index, source in enumerate(source_items, start=1)
+            }
+            for future in as_completed(futures):
+                index, source = futures[future]
+                try:
+                    item, error = future.result()
+                except Exception as exc:  # noqa: BLE001
+                    error = {
+                        "id": str(uuid4()),
+                        "item_name": source.name,
+                        "error_type": "enrichment_error",
+                        "message": repr(exc),
+                        "raw_payload": source.model_dump(mode="json"),
+                    }
+                    item_data = source.model_dump(mode="json")
+                    item_data["id"] = str(
+                        uuid5(NAMESPACE_URL, f"reznar:{normalized_name(source.name)}")
+                    )
+                    item_data["mechanics"] = ItemMechanics().model_dump(mode="json")
+                    item = MagicItem.model_validate(item_data)
+                enriched_by_index[index - 1] = item
+                if error is not None:
+                    errors.append(error)
+                print(f"enrich: done {index}/{len(source_items)} {source.name}")
+        enriched = [item for item in enriched_by_index if item is not None]
 
     artifact = {
         "items": [item.model_dump(mode="json") for item in enriched],
@@ -1466,6 +1508,15 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--last-page", type=int, help="Last PDF page to render/OCR.")
     parser.add_argument("--limit", type=int, help="Limit the number of pages/items processed.")
     parser.add_argument("--sleep", type=float, default=0.0, help="Seconds to sleep between API calls.")
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help=(
+            "Parallel workers for the enrichment stage. Page extraction stays "
+            "sequential to preserve previous-page context."
+        ),
+    )
     parser.add_argument("--force", action="store_true", help="Rebuild existing artifacts for the stage.")
     parser.add_argument(
         "--no-ocr-context",
@@ -1543,7 +1594,14 @@ def main(argv: list[str] | None = None) -> None:
             collect_source_items(paths)
         ensure_no_source_page_errors(paths)
         client = GeminiClient(api_key=get_api_key(), model=args.model, api_base=args.api_base)
-        enrich_items(paths, client=client, limit=args.limit, force=args.force, sleep_seconds=args.sleep)
+        enrich_items(
+            paths,
+            client=client,
+            limit=args.limit,
+            force=args.force,
+            sleep_seconds=args.sleep,
+            workers=args.workers,
+        )
     if args.stage in {"load", "all"}:
         if not paths.enriched_items.exists():
             raise SystemExit("Run the enrich stage before load.")
