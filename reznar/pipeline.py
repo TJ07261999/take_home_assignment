@@ -3,7 +3,8 @@
 Pipeline:
 
 PDF -> rendered page PNGs -> OCR provenance text -> Gemini VLM source extraction
--> Pydantic validation -> Gemini LLM semantic enrichment -> Postgres.
+-> Pydantic validation -> Gemini LLM semantic enrichment -> Postgres
+-> CSV/SQL exports.
 
 The VLM is the structured source extractor. OCR is intentionally auxiliary: it
 is saved for audit/debugging and can be passed to Gemini as noisy context, but
@@ -15,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import csv
 import json
 import os
 import re
@@ -41,6 +43,33 @@ from reznar.ontology import CatalogPageExtraction, ItemMechanics, MagicItem, Sou
 DEFAULT_MODEL = "gemini-2.5-flash"
 DEFAULT_API_BASE = "https://generativelanguage.googleapis.com/v1beta"
 ENRICH_ITEM_ATTEMPTS = 3
+
+
+EXPORT_COLUMNS = [
+    "id",
+    "name",
+    "item_kind",
+    "subtype",
+    "rarity",
+    "requires_attunement",
+    "attunement_requirement",
+    "is_cursed",
+    "printed_type_line",
+    "source_pages",
+    "description",
+    "equipment_slots",
+    "bonuses",
+    "damage_types",
+    "defenses",
+    "spells_granted",
+    "conditions_inflicted",
+    "target_creatures",
+    "environment_tags",
+    "usage_limits",
+    "action_economy",
+    "warnings",
+    "data_json",
+]
 
 
 SOURCE_EXTRACTION_SHAPE = {
@@ -1081,6 +1110,185 @@ def load_postgres(paths: Paths) -> None:
     )
 
 
+def _compact_json(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+
+
+def _join_list(values: list[Any]) -> str:
+    return "; ".join(str(value) for value in values)
+
+
+def _export_row(item: MagicItem) -> dict[str, str]:
+    data = item.model_dump(mode="json")
+    mechanics = data.get("mechanics", {})
+    return {
+        "id": data["id"],
+        "name": data["name"],
+        "item_kind": data["item_kind"],
+        "subtype": data.get("subtype") or "",
+        "rarity": data["rarity"],
+        "requires_attunement": str(data["requires_attunement"]).lower(),
+        "attunement_requirement": data.get("attunement_requirement") or "",
+        "is_cursed": str(data["is_cursed"]).lower(),
+        "printed_type_line": data["printed_type_line"],
+        "source_pages": _join_list(data.get("source_pages", [])),
+        "description": data["description"],
+        "equipment_slots": _join_list(mechanics.get("equipment_slots", [])),
+        "bonuses": _compact_json(mechanics.get("bonuses", [])),
+        "damage_types": _join_list(mechanics.get("damage_types", [])),
+        "defenses": _compact_json(mechanics.get("defenses", [])),
+        "spells_granted": _join_list(mechanics.get("spells_granted", [])),
+        "conditions_inflicted": _join_list(mechanics.get("conditions_inflicted", [])),
+        "target_creatures": _join_list(mechanics.get("target_creatures", [])),
+        "environment_tags": _join_list(mechanics.get("environment_tags", [])),
+        "usage_limits": _compact_json(mechanics.get("usage_limits", [])),
+        "action_economy": _join_list(mechanics.get("action_economy", [])),
+        "warnings": _join_list(data.get("warnings", [])),
+        "data_json": _compact_json(data),
+    }
+
+
+def _sql_literal(value: str | None) -> str:
+    if value is None:
+        return "null"
+    return "'" + value.replace("'", "''") + "'"
+
+
+def _sql_nullable(value: str) -> str:
+    return "null" if value == "" else _sql_literal(value)
+
+
+def _sql_bool(value: str) -> str:
+    return "true" if value == "true" else "false"
+
+
+def _sql_int_array(values: str) -> str:
+    if not values:
+        return "array[]::integer[]"
+    pages = [page.strip() for page in values.split(";") if page.strip()]
+    return "array[" + ", ".join(pages) + "]::integer[]"
+
+
+def _sql_jsonb(value: str) -> str:
+    return _sql_literal(value) + "::jsonb"
+
+
+def export_items(paths: Paths) -> None:
+    if not paths.enriched_items.exists():
+        raise SystemExit("Run the enrich stage before export.")
+    items, enrichment_errors = load_enriched_items(paths)
+    ensure_dir(paths.work_dir)
+
+    rows = [_export_row(item) for item in items]
+    csv_path = paths.work_dir / "magic_items.csv"
+    sql_path = paths.work_dir / "magic_items.sql"
+
+    with csv_path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=EXPORT_COLUMNS)
+        writer.writeheader()
+        writer.writerows(rows)
+
+    sql_columns = [
+        "id",
+        "name",
+        "item_kind",
+        "subtype",
+        "rarity",
+        "requires_attunement",
+        "attunement_requirement",
+        "is_cursed",
+        "printed_type_line",
+        "source_pages",
+        "description",
+        "equipment_slots",
+        "bonuses",
+        "damage_types",
+        "defenses",
+        "spells_granted",
+        "conditions_inflicted",
+        "target_creatures",
+        "environment_tags",
+        "usage_limits",
+        "action_economy",
+        "warnings",
+        "data",
+    ]
+    sql_lines = [
+        "-- Reznar magic item export generated from items_enriched.json.",
+        "-- This table is intentionally separate from the application load tables.",
+        "create table if not exists magic_item_export (",
+        "    id uuid primary key,",
+        "    name text not null,",
+        "    item_kind text not null,",
+        "    subtype text,",
+        "    rarity text not null,",
+        "    requires_attunement boolean not null,",
+        "    attunement_requirement text,",
+        "    is_cursed boolean not null,",
+        "    printed_type_line text not null,",
+        "    source_pages integer[] not null,",
+        "    description text not null,",
+        "    equipment_slots text not null,",
+        "    bonuses jsonb not null,",
+        "    damage_types text not null,",
+        "    defenses jsonb not null,",
+        "    spells_granted text not null,",
+        "    conditions_inflicted text not null,",
+        "    target_creatures text not null,",
+        "    environment_tags text not null,",
+        "    usage_limits jsonb not null,",
+        "    action_economy text not null,",
+        "    warnings text not null,",
+        "    data jsonb not null",
+        ");",
+        "truncate table magic_item_export;",
+    ]
+    if rows:
+        sql_lines.append(
+            "insert into magic_item_export (" + ", ".join(sql_columns) + ") values"
+        )
+        values: list[str] = []
+        for row in rows:
+            values.append(
+                "    ("
+                + ", ".join(
+                    [
+                        _sql_literal(row["id"]),
+                        _sql_literal(row["name"]),
+                        _sql_literal(row["item_kind"]),
+                        _sql_nullable(row["subtype"]),
+                        _sql_literal(row["rarity"]),
+                        _sql_bool(row["requires_attunement"]),
+                        _sql_nullable(row["attunement_requirement"]),
+                        _sql_bool(row["is_cursed"]),
+                        _sql_literal(row["printed_type_line"]),
+                        _sql_int_array(row["source_pages"]),
+                        _sql_literal(row["description"]),
+                        _sql_literal(row["equipment_slots"]),
+                        _sql_jsonb(row["bonuses"]),
+                        _sql_literal(row["damage_types"]),
+                        _sql_jsonb(row["defenses"]),
+                        _sql_literal(row["spells_granted"]),
+                        _sql_literal(row["conditions_inflicted"]),
+                        _sql_literal(row["target_creatures"]),
+                        _sql_literal(row["environment_tags"]),
+                        _sql_jsonb(row["usage_limits"]),
+                        _sql_literal(row["action_economy"]),
+                        _sql_literal(row["warnings"]),
+                        _sql_jsonb(row["data_json"]),
+                    ]
+                )
+                + ")"
+            )
+        sql_lines.append(",\n".join(values) + ";")
+    sql_path.write_text("\n".join(sql_lines) + "\n", encoding="utf-8")
+
+    print(f"export: wrote {len(rows)} CSV rows to {csv_path}")
+    print(f"export: wrote {len(rows)} SQL rows to {sql_path}")
+    if enrichment_errors:
+        print(f"export: warning - {len(enrichment_errors)} enrichment errors are recorded")
+
+
 def print_summary(paths: Paths) -> None:
     if not paths.enriched_items.exists() and not paths.source_items.exists():
         print("summary: no item artifact found yet")
@@ -1240,6 +1448,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
             "collect",
             "enrich",
             "load",
+            "export",
             "all",
             "summary",
             "validate",
@@ -1339,6 +1548,8 @@ def main(argv: list[str] | None = None) -> None:
         if not paths.enriched_items.exists():
             raise SystemExit("Run the enrich stage before load.")
         load_postgres(paths)
+    if args.stage in {"export", "all"}:
+        export_items(paths)
     if args.stage in {"summary", "all"}:
         print_summary(paths)
     if args.stage == "validate":

@@ -23,7 +23,7 @@ At a high level:
 
 ```text
 PDF -> page PNGs -> OCR provenance text -> Gemini VLM source extraction
--> Pydantic validation -> Gemini LLM semantic tags -> Postgres
+-> Pydantic validation -> Gemini LLM semantic tags -> Postgres + CSV/SQL exports
 ```
 
 The PDF is image-based, so the pipeline uses Gemini vision as the primary
@@ -55,6 +55,8 @@ Pipeline quality controls:
   product spans multiple pages.
 - The enrichment pass retries transient Gemini timeouts per item before marking
   an enrichment error.
+- The export stage writes `magic_items.csv` and `magic_items.sql` for review
+  workflows that prefer files over a live local database.
 - `uv run python -m reznar.pipeline validate --work-dir data/extracted_fresh`
   checks generated artifacts and Postgres consistency.
 

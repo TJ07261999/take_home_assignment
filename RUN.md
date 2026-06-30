@@ -59,8 +59,8 @@ uv run python -m reznar.pipeline all --pdf data/items_combined.pdf --work-dir da
 
 This single command renders all 39 PDF pages, runs OCR for page-level
 provenance, extracts structured item records with Gemini vision, validates and
-collects source items, enriches semantic mechanics tags, loads Postgres, and
-prints a summary.
+collects source items, enriches semantic mechanics tags, loads Postgres, writes
+CSV/SQL exports, and prints a summary.
 
 Validate the generated artifacts and loaded Postgres tables:
 
@@ -136,6 +136,7 @@ If running stages manually, enrich semantic tags and load Postgres:
 ```bash
 uv run python -m reznar.pipeline enrich --work-dir data/extracted_fresh --sleep 10
 uv run python -m reznar.pipeline load --work-dir data/extracted_fresh
+uv run python -m reznar.pipeline export --work-dir data/extracted_fresh
 ```
 
 The enrichment stage automatically retries transient Gemini timeouts for each
@@ -151,6 +152,8 @@ ocr/                  Tesseract OCR helper text
 vlm_pages/            raw per-page Gemini extraction records
 items_source.json     merged and Pydantic-validated source item records
 items_enriched.json   final ontology records with semantic mechanics tags
+magic_items.csv       flat export for spreadsheet/review workflows
+magic_items.sql       standalone Postgres import for magic_item_export
 ```
 
 These files are intentionally kept outside the database so extraction can be
@@ -159,6 +162,13 @@ audited and resumed without re-running every stage.
 The item `description` fields are concise non-verbatim mechanics summaries.
 Complete page-level OCR text is preserved in `ocr/` artifacts and in the
 `extraction_page.ocr_text` database column.
+
+The export stage writes two reviewer-friendly result files:
+
+- `magic_items.csv` flattens the catalog into sortable columns while retaining
+  the full ontology record in `data_json`.
+- `magic_items.sql` creates and populates a standalone `magic_item_export`
+  table with the same flattened columns plus full JSONB data.
 
 ## 5. Database Tables
 
