@@ -4,7 +4,7 @@ Pipeline:
 
 PDF -> rendered page PNGs -> OCR provenance text -> Gemini VLM source extraction
 -> Pydantic validation -> Gemini LLM semantic enrichment -> Postgres
--> CSV/SQL exports.
+-> CSV/SQL/SQLite exports.
 
 The VLM is the structured source extractor. OCR is intentionally auxiliary: it
 is saved for audit/debugging and can be passed to Gemini as noisy context, but
@@ -158,10 +158,18 @@ def require_tool(name: str) -> str:
     return path
 
 
-def run(cmd: list[str], cwd: Path) -> subprocess.CompletedProcess[str]:
+def run(
+    cmd: list[str],
+    cwd: Path,
+    env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    process_env = os.environ.copy()
+    if env:
+        process_env.update(env)
     return subprocess.run(
         cmd,
         cwd=str(cwd),
+        env=process_env,
         check=True,
         text=True,
         stdout=subprocess.PIPE,
@@ -327,6 +335,16 @@ def render_pages(
     return all_paths
 
 
+def ocr_one_page(paths: Paths, psm: int, image_path: Path) -> Path:
+    page = page_number_from_path(image_path)
+    out_path = paths.ocr_dir / f"page-{page:03d}.txt"
+    cmd = ["tesseract", str(image_path), "stdout", "--psm", str(psm)]
+    print(f"ocr: page {page}")
+    result = run(cmd, cwd=paths.root, env={"OMP_THREAD_LIMIT": "1"})
+    out_path.write_text(result.stdout, encoding="utf-8")
+    return out_path
+
+
 def ocr_pages(
     paths: Paths,
     psm: int,
@@ -334,10 +352,12 @@ def ocr_pages(
     pages: list[int] | None = None,
     first_page: int | None = None,
     last_page: int | None = None,
+    workers: int = 1,
 ) -> list[Path]:
     require_tool("tesseract")
     ensure_dir(paths.ocr_dir)
     outputs: list[Path] = []
+    to_ocr: list[Path] = []
     for image_path in selected_existing_page_images(
         paths.page_dir, pages=pages, first_page=first_page, last_page=last_page
     ):
@@ -346,10 +366,30 @@ def ocr_pages(
         outputs.append(out_path)
         if out_path.exists() and not force:
             continue
-        cmd = ["tesseract", str(image_path), "stdout", "--psm", str(psm)]
-        print(f"ocr: page {page}")
-        result = run(cmd, cwd=paths.root)
-        out_path.write_text(result.stdout, encoding="utf-8")
+        to_ocr.append(image_path)
+
+    if to_ocr:
+        ocr_workers = min(
+            max(1, workers),
+            max(1, os.cpu_count() or 1),
+            len(to_ocr),
+        )
+        if ocr_workers == 1:
+            for image_path in to_ocr:
+                ocr_one_page(paths, psm, image_path)
+        else:
+            print(f"ocr: processing {len(to_ocr)} pages with {ocr_workers} workers")
+            with ThreadPoolExecutor(max_workers=ocr_workers) as executor:
+                futures = {
+                    executor.submit(
+                        ocr_one_page, paths, psm, image_path
+                    ): page_number_from_path(image_path)
+                    for image_path in to_ocr
+                }
+                for future in as_completed(futures):
+                    page = futures[future]
+                    future.result()
+                    print(f"ocr: done page {page}")
     print(f"ocr: ready for {len(outputs)} pages")
     return outputs
 
@@ -2072,9 +2112,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         type=int,
         default=1,
         help=(
-            "Parallel workers for rendering, page extraction first pass, and "
-            "enrichment. Extraction reruns continuation/error-sensitive pages "
-            "sequentially."
+            "Parallel workers for rendering, OCR, page extraction first pass, "
+            "and enrichment. Extraction reruns continuation/error-sensitive "
+            "pages sequentially."
         ),
     )
     parser.add_argument("--force", action="store_true", help="Rebuild existing artifacts for the stage.")
@@ -2118,6 +2158,7 @@ def main(argv: list[str] | None = None) -> None:
             pages=args.page,
             first_page=args.first_page,
             last_page=args.last_page,
+            workers=args.workers,
         )
     if args.stage in {"extract", "all"}:
         if not existing_page_images(paths.page_dir):
@@ -2137,6 +2178,7 @@ def main(argv: list[str] | None = None) -> None:
                 pages=args.page,
                 first_page=args.first_page,
                 last_page=args.last_page,
+                workers=args.workers,
             )
         client = GeminiClient(api_key=get_api_key(), model=args.model, api_base=args.api_base)
         extract_pages(

@@ -63,7 +63,7 @@ collects source items, enriches semantic mechanics tags, loads Postgres, writes
 CSV/SQL exports, and prints a summary.
 
 `--workers 16` parallelizes the expensive stages while keeping `--dpi 200`.
-Rendering runs pages concurrently and caps local render workers to the machine's
+Rendering and OCR run pages concurrently and cap local workers to the machine's
 CPU count. Page extraction uses a parallel first pass, then reruns
 continuation/error-sensitive pages sequentially with previous-page context
 before collection. Enrichment is also parallel because each item can be tagged

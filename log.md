@@ -41,9 +41,10 @@
   arrays inside spreadsheet cells.
 - Added `reznar_exports.sqlite` so the same export can be opened directly in
   DB Browser for SQLite as relational tables and readable item/effect views.
-- Added optional `--workers` support for expensive stages. Rendering runs pages
-  concurrently at the requested DPI, page extraction uses a parallel first pass
-  plus sequential context repair for continuation/error-sensitive pages, and
-  enrichment tags independent items in parallel. The fast run uses 16 workers.
+- Added optional `--workers` support for expensive stages. Rendering and OCR
+  run pages concurrently at the requested DPI, page extraction uses a parallel
+  first pass plus sequential context repair for continuation/error-sensitive
+  pages, and enrichment tags independent items in parallel. The fast run uses
+  16 workers.
 - Final validated run loaded 39 page records, 80 magic items, and 0 errors into
   local Postgres.
