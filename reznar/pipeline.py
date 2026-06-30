@@ -204,12 +204,47 @@ def selected_existing_page_images(
     return images
 
 
+def render_one_page(paths: Paths, dpi: int, page: int, tmp_dir: Path) -> Path:
+    page_tmp_dir = tmp_dir / f"page-{page:03d}"
+    page_tmp_dir.mkdir(parents=True, exist_ok=True)
+    prefix = page_tmp_dir / "page"
+    cmd = [
+        "pdftoppm",
+        "-singlefile",
+        "-png",
+        "-r",
+        str(dpi),
+        "-f",
+        str(page),
+        "-l",
+        str(page),
+        str(paths.pdf),
+        str(prefix),
+    ]
+    print("render:", " ".join(cmd))
+    run(cmd, cwd=paths.root)
+    rendered = prefix.with_suffix(".png")
+    if not rendered.exists():
+        matches = sorted(page_tmp_dir.glob("*.png"))
+        if not matches:
+            raise FileNotFoundError(f"pdftoppm did not create a PNG for page {page}")
+        rendered = matches[0]
+
+    stable = paths.page_dir / f"page-{page:03d}.png"
+    if stable.exists():
+        stable.unlink()
+    rendered.rename(stable)
+    shutil.rmtree(page_tmp_dir)
+    return stable
+
+
 def render_pages(
     paths: Paths,
     dpi: int,
     force: bool,
     first_page: int | None = None,
     last_page: int | None = None,
+    workers: int = 1,
 ) -> list[Path]:
     require_tool("pdftoppm")
     ensure_dir(paths.page_dir)
@@ -235,34 +270,53 @@ def render_pages(
         for png in existing:
             png.unlink()
 
+    pages_to_render = (
+        sorted(expected_pages)
+        if force
+        else sorted(expected_pages - existing_pages)
+    )
+    if not pages_to_render:
+        return selected_existing_page_images(
+            paths.page_dir, first_page=first_page, last_page=last_page
+        )
+
     tmp_dir = paths.page_dir / "_render_tmp"
     if tmp_dir.exists():
         shutil.rmtree(tmp_dir)
     tmp_dir.mkdir(parents=True)
-
-    prefix = tmp_dir / "page"
-    cmd = ["pdftoppm", "-png", "-r", str(dpi)]
-    if first_page is not None:
-        cmd.extend(["-f", str(first_page)])
-    if last_page is not None:
-        cmd.extend(["-l", str(last_page)])
-    cmd.extend([str(paths.pdf), str(prefix)])
-    print("render:", " ".join(cmd))
-    run(cmd, cwd=paths.root)
-
-    rendered = sorted(tmp_dir.glob("page-*.png"))
     stable_paths: list[Path] = []
-    for index, path in enumerate(rendered, start=start_page):
-        stable = paths.page_dir / f"page-{index:03d}.png"
-        if path != stable:
-            if stable.exists():
-                stable.unlink()
-            path.rename(stable)
-        stable_paths.append(stable)
-    shutil.rmtree(tmp_dir)
+    try:
+        render_workers = min(
+            max(1, workers),
+            max(1, os.cpu_count() or 1),
+            len(pages_to_render),
+        )
+        if render_workers == 1:
+            for page in pages_to_render:
+                stable_paths.append(render_one_page(paths, dpi, page, tmp_dir))
+        else:
+            print(
+                f"render: processing {len(pages_to_render)} pages "
+                f"with {render_workers} workers at {dpi} dpi"
+            )
+            with ThreadPoolExecutor(max_workers=render_workers) as executor:
+                futures = {
+                    executor.submit(render_one_page, paths, dpi, page, tmp_dir): page
+                    for page in pages_to_render
+                }
+                for future in as_completed(futures):
+                    page = futures[future]
+                    stable_paths.append(future.result())
+                    print(f"render: done page {page}")
+    finally:
+        if tmp_dir.exists():
+            shutil.rmtree(tmp_dir)
 
-    print(f"render: wrote {len(stable_paths)} page images")
-    return stable_paths
+    all_paths = selected_existing_page_images(
+        paths.page_dir, first_page=first_page, last_page=last_page
+    )
+    print(f"render: ready for {len(all_paths)} page images")
+    return all_paths
 
 
 def ocr_pages(
@@ -573,6 +627,86 @@ def is_recitation_stop(exc: Exception) -> bool:
     return "RECITATION" in repr(exc)
 
 
+def extract_one_page(
+    paths: Paths,
+    client: GeminiClient,
+    image_path: Path,
+    force: bool,
+    sleep_seconds: float,
+    use_ocr_context: bool,
+    previous_context: str | None = None,
+    pass_name: str = "sequential",
+) -> Path:
+    page = page_number_from_path(image_path)
+    out_path = paths.vlm_dir / f"page-{page:03d}.json"
+    previous_record = read_json_file(out_path)
+    if out_path.exists() and not force:
+        print(f"extract: page {page} exists, skipping")
+        return out_path
+
+    ocr_path = paths.ocr_dir / f"page-{page:03d}.txt"
+    ocr_text = (
+        ocr_path.read_text(encoding="utf-8")
+        if use_ocr_context and ocr_path.exists()
+        else ""
+    )
+    context = previous_context if previous_context is not None else load_previous_page_context(paths, page)
+    prompt = build_source_prompt(page, ocr_text, context)
+    print(f"extract: page {page} ({pass_name})")
+    record: dict[str, Any] = {
+        "page_number": page,
+        "image_path": str(image_path),
+        "ocr_path": str(ocr_path),
+        "ocr_context_used": bool(ocr_text),
+        "extraction_pass": pass_name,
+        "status": "pending",
+    }
+    try:
+        try:
+            parsed, raw_response = client.generate_json(prompt, image_path=image_path)
+        except ValueError as exc:
+            if not is_recitation_stop(exc):
+                raise
+            record["recitation_retry_error"] = repr(exc)
+            parsed, raw_response = client.generate_json(
+                build_source_prompt(
+                    page,
+                    ocr_text="",
+                    previous_context=context,
+                    recitation_retry=True,
+                ),
+                image_path=image_path,
+            )
+            record["recitation_retry_used"] = True
+        try:
+            extraction = CatalogPageExtraction.model_validate(parsed)
+        except ValidationError as exc:
+            repaired, repair_raw = client.generate_json(
+                build_repair_prompt(
+                    json.dumps(parsed, indent=2), str(exc), "CatalogPageExtraction"
+                )
+            )
+            extraction = CatalogPageExtraction.model_validate(repaired)
+            record["repair_raw_response"] = repair_raw
+            record["repaired_json"] = repaired
+
+        for item in extraction.items:
+            item.source_pages = [page]
+        record.update(
+            {
+                "status": "ok",
+                "raw_response": raw_response,
+                "validated": extraction.model_dump(mode="json"),
+            }
+        )
+    except Exception as exc:  # noqa: BLE001
+        record.update({"status": "error", "error": repr(exc)})
+    write_extraction_record(out_path, record, previous_record)
+    if sleep_seconds:
+        time.sleep(sleep_seconds)
+    return out_path
+
+
 def extract_pages(
     paths: Paths,
     client: GeminiClient,
@@ -583,75 +717,93 @@ def extract_pages(
     force: bool,
     sleep_seconds: float,
     use_ocr_context: bool,
+    workers: int,
 ) -> list[Path]:
     ensure_dir(paths.vlm_dir)
-    outputs: list[Path] = []
-    for image_path in select_pages(paths, pages, limit, first_page=first_page, last_page=last_page):
+    images = select_pages(paths, pages, limit, first_page=first_page, last_page=last_page)
+    outputs = [paths.vlm_dir / f"page-{page_number_from_path(path):03d}.json" for path in images]
+    workers = max(1, workers)
+    if workers == 1 or len(images) <= 1:
+        for image_path in images:
+            extract_one_page(
+                paths,
+                client,
+                image_path=image_path,
+                force=force,
+                sleep_seconds=sleep_seconds,
+                use_ocr_context=use_ocr_context,
+            )
+        return outputs
+
+    pending_images: list[Path] = []
+    for image_path in images:
         page = page_number_from_path(image_path)
         out_path = paths.vlm_dir / f"page-{page:03d}.json"
-        outputs.append(out_path)
-        previous_record = read_json_file(out_path)
         if out_path.exists() and not force:
             print(f"extract: page {page} exists, skipping")
             continue
+        pending_images.append(image_path)
+    if not pending_images:
+        return outputs
 
-        ocr_path = paths.ocr_dir / f"page-{page:03d}.txt"
-        ocr_text = (
-            ocr_path.read_text(encoding="utf-8")
-            if use_ocr_context and ocr_path.exists()
-            else ""
-        )
-        previous_context = load_previous_page_context(paths, page)
-        prompt = build_source_prompt(page, ocr_text, previous_context)
-        print(f"extract: page {page}")
-        record: dict[str, Any] = {
-            "page_number": page,
-            "image_path": str(image_path),
-            "ocr_path": str(ocr_path),
-            "ocr_context_used": bool(ocr_text),
-            "status": "pending",
+    print(f"extract: processing {len(pending_images)} pages with {workers} workers")
+    parallel_context = "Parallel first pass: previous page context intentionally omitted."
+    max_workers = min(workers, len(pending_images))
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(
+                extract_one_page,
+                paths,
+                client,
+                image_path=image_path,
+                force=force,
+                sleep_seconds=sleep_seconds,
+                use_ocr_context=use_ocr_context,
+                previous_context=parallel_context,
+                pass_name="parallel_first_pass",
+            ): image_path
+            for image_path in pending_images
         }
-        try:
+        for future in as_completed(futures):
+            image_path = futures[future]
+            page = page_number_from_path(image_path)
             try:
-                parsed, raw_response = client.generate_json(prompt, image_path=image_path)
-            except ValueError as exc:
-                if not is_recitation_stop(exc):
-                    raise
-                record["recitation_retry_error"] = repr(exc)
-                parsed, raw_response = client.generate_json(
-                    build_source_prompt(
-                        page,
-                        ocr_text="",
-                        previous_context=previous_context,
-                        recitation_retry=True,
-                    ),
-                    image_path=image_path,
-                )
-                record["recitation_retry_used"] = True
-            try:
-                extraction = CatalogPageExtraction.model_validate(parsed)
-            except ValidationError as exc:
-                repaired, repair_raw = client.generate_json(
-                    build_repair_prompt(json.dumps(parsed, indent=2), str(exc), "CatalogPageExtraction")
-                )
-                extraction = CatalogPageExtraction.model_validate(repaired)
-                record["repair_raw_response"] = repair_raw
-                record["repaired_json"] = repaired
-
-            for item in extraction.items:
-                item.source_pages = [page]
-            record.update(
-                {
-                    "status": "ok",
-                    "raw_response": raw_response,
-                    "validated": extraction.model_dump(mode="json"),
+                future.result()
+            except Exception as exc:  # noqa: BLE001
+                out_path = paths.vlm_dir / f"page-{page:03d}.json"
+                previous_record = read_json_file(out_path)
+                record = {
+                    "page_number": page,
+                    "image_path": str(image_path),
+                    "ocr_path": str(paths.ocr_dir / f"page-{page:03d}.txt"),
+                    "ocr_context_used": False,
+                    "extraction_pass": "parallel_first_pass",
+                    "status": "error",
+                    "error": repr(exc),
                 }
-            )
-        except Exception as exc:  # noqa: BLE001
-            record.update({"status": "error", "error": repr(exc)})
-        write_extraction_record(out_path, record, previous_record)
-        if sleep_seconds:
-            time.sleep(sleep_seconds)
+                write_extraction_record(out_path, record, previous_record)
+            print(f"extract: done page {page}")
+
+    selected_pages = {page_number_from_path(path) for path in images}
+    repair_pages = find_context_repair_pages(paths, selected_pages)
+    if repair_pages:
+        print(
+            "extract: sequential context repair for pages "
+            + ", ".join(str(page) for page in repair_pages)
+        )
+    for page in repair_pages:
+        image_path = paths.page_dir / f"page-{page:03d}.png"
+        if not image_path.exists():
+            continue
+        extract_one_page(
+            paths,
+            client,
+            image_path=image_path,
+            force=True,
+            sleep_seconds=sleep_seconds,
+            use_ocr_context=use_ocr_context,
+            pass_name="context_repair",
+        )
     return outputs
 
 
@@ -699,6 +851,44 @@ def is_continuation_only(item: SourceMagicItem) -> bool:
     if item.item_kind.value == "other" and item.rarity.value == "unknown":
         return True
     return False
+
+
+def find_context_repair_pages(paths: Paths, selected_pages: set[int]) -> list[int]:
+    repair_pages: set[int] = set()
+    page_items: dict[int, list[SourceMagicItem]] = {}
+    page_status: dict[int, str] = {}
+
+    for page in sorted(selected_pages):
+        page_file = paths.vlm_dir / f"page-{page:03d}.json"
+        if not page_file.exists():
+            repair_pages.add(page)
+            continue
+        try:
+            payload = json.loads(page_file.read_text(encoding="utf-8"))
+            status = payload.get("status", "unknown")
+            page_status[page] = status
+            if status != "ok":
+                repair_pages.add(page)
+                continue
+            extraction = CatalogPageExtraction.model_validate(payload["validated"])
+        except Exception:  # noqa: BLE001
+            repair_pages.add(page)
+            continue
+
+        page_items[page] = extraction.items
+        for item in extraction.items:
+            if item.continues_from_previous_page or is_continuation_only(item):
+                repair_pages.add(page)
+            if item.continues_on_next_page and page + 1 in selected_pages:
+                repair_pages.add(page + 1)
+
+    for page in sorted(selected_pages):
+        previous_items = page_items.get(page - 1, [])
+        if page_status.get(page) == "ok" and not page_items.get(page):
+            if any(item.continues_on_next_page for item in previous_items):
+                repair_pages.add(page)
+
+    return sorted(repair_pages)
 
 
 def merge_item_fields(prior: SourceMagicItem, item: SourceMagicItem) -> None:
@@ -1513,8 +1703,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         type=int,
         default=1,
         help=(
-            "Parallel workers for the enrichment stage. Page extraction stays "
-            "sequential to preserve previous-page context."
+            "Parallel workers for rendering, page extraction first pass, and "
+            "enrichment. Extraction reruns continuation/error-sensitive pages "
+            "sequentially."
         ),
     )
     parser.add_argument("--force", action="store_true", help="Rebuild existing artifacts for the stage.")
@@ -1539,6 +1730,7 @@ def main(argv: list[str] | None = None) -> None:
             force=args.force,
             first_page=args.first_page,
             last_page=args.last_page,
+            workers=args.workers,
         )
     if args.stage in {"ocr", "all"}:
         if not existing_page_images(paths.page_dir):
@@ -1548,6 +1740,7 @@ def main(argv: list[str] | None = None) -> None:
                 force=False,
                 first_page=args.first_page,
                 last_page=args.last_page,
+                workers=args.workers,
             )
         ocr_pages(
             paths,
@@ -1565,6 +1758,7 @@ def main(argv: list[str] | None = None) -> None:
                 force=False,
                 first_page=args.first_page,
                 last_page=args.last_page,
+                workers=args.workers,
             )
         if not list(paths.ocr_dir.glob("page-*.txt")):
             ocr_pages(
@@ -1586,6 +1780,7 @@ def main(argv: list[str] | None = None) -> None:
             force=args.force,
             sleep_seconds=args.sleep,
             use_ocr_context=not args.no_ocr_context,
+            workers=args.workers,
         )
     if args.stage in {"collect", "all"}:
         collect_source_items(paths)

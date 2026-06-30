@@ -55,8 +55,10 @@ Pipeline quality controls:
   product spans multiple pages.
 - The enrichment pass retries transient Gemini timeouts per item before marking
   an enrichment error.
-- The enrichment stage supports `--workers` for parallel item tagging; the
-  recommended fast run uses `--workers 16`.
+- The expensive stages support `--workers`: rendering runs pages concurrently
+  at the requested DPI, page extraction runs a parallel first pass with
+  sequential context repair for continuation/error-sensitive pages, and
+  enrichment tags independent items in parallel.
 - The export stage writes `magic_items.csv` and `magic_items.sql` for review
   workflows that prefer files over a live local database.
 - `uv run python -m reznar.pipeline validate --work-dir data/extracted_fresh`

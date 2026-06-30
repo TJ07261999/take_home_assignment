@@ -36,8 +36,9 @@
   required fields, OCR provenance, table existence, and zero extraction errors.
 - Added `export` stage to write reviewer-friendly `magic_items.csv` and
   `magic_items.sql` files from the validated enriched ontology artifact.
-- Added optional `--workers` support for the independent enrichment pass; the
-  fast run uses 16 workers while page extraction stays sequential for
-  continuation-page context.
+- Added optional `--workers` support for expensive stages. Rendering runs pages
+  concurrently at the requested DPI, page extraction uses a parallel first pass
+  plus sequential context repair for continuation/error-sensitive pages, and
+  enrichment tags independent items in parallel. The fast run uses 16 workers.
 - Final validated run loaded 39 page records, 80 magic items, and 0 errors into
   local Postgres.

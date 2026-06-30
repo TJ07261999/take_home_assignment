@@ -62,10 +62,13 @@ provenance, extracts structured item records with Gemini vision, validates and
 collects source items, enriches semantic mechanics tags, loads Postgres, writes
 CSV/SQL exports, and prints a summary.
 
-`--workers 16` parallelizes the independent enrichment pass. Page extraction
-stays sequential so multi-page items can still use previous-page context. If the
-Gemini API returns temporary 429/503 rate-limit errors, rerun the failed stage
-with `--workers 8` or `--workers 4`.
+`--workers 16` parallelizes the expensive stages while keeping `--dpi 200`.
+Rendering runs pages concurrently and caps local render workers to the machine's
+CPU count. Page extraction uses a parallel first pass, then reruns
+continuation/error-sensitive pages sequentially with previous-page context
+before collection. Enrichment is also parallel because each item can be tagged
+independently. If the Gemini API returns temporary 429/503 rate-limit errors,
+rerun the failed stage with `--workers 8` or `--workers 4`.
 
 Validate the generated artifacts and loaded Postgres tables:
 
