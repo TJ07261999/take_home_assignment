@@ -59,18 +59,25 @@ EXPORT_COLUMNS = [
     "source_pages",
     "description",
     "equipment_slots",
+    "bonus_summary",
     "bonuses",
     "damage_types",
+    "defense_summary",
     "defenses",
     "spells_granted",
     "conditions_inflicted",
     "target_creatures",
     "environment_tags",
+    "usage_limit_summary",
     "usage_limits",
     "action_economy",
     "warnings",
     "data_json",
 ]
+
+BONUS_EXPORT_COLUMNS = ["item_id", "item_name", "target", "value", "context"]
+DEFENSE_EXPORT_COLUMNS = ["item_id", "item_name", "kind", "target", "context"]
+USAGE_LIMIT_EXPORT_COLUMNS = ["item_id", "item_name", "kind", "amount", "reset", "context"]
 
 
 SOURCE_EXTRACTION_SHAPE = {
@@ -1350,9 +1357,49 @@ def _join_list(values: list[Any]) -> str:
     return "; ".join(str(value) for value in values)
 
 
+def _format_bonus(value: dict[str, Any]) -> str:
+    amount = str(value.get("value") or "").strip()
+    target = str(value.get("target") or "").strip()
+    context = str(value.get("context") or "").strip()
+    phrase = " ".join(part for part in [amount, target] if part)
+    if context:
+        phrase = f"{phrase} ({context})" if phrase else context
+    return phrase
+
+
+def _format_defense(value: dict[str, Any]) -> str:
+    kind = str(value.get("kind") or "").strip()
+    target = str(value.get("target") or "").strip()
+    context = str(value.get("context") or "").strip()
+    phrase = " to ".join(part for part in [kind, target] if part)
+    if context:
+        phrase = f"{phrase} ({context})" if phrase else context
+    return phrase
+
+
+def _format_usage_limit(value: dict[str, Any]) -> str:
+    kind = str(value.get("kind") or "").strip()
+    amount = str(value.get("amount") or "").strip()
+    reset = str(value.get("reset") or "").strip()
+    context = str(value.get("context") or "").strip()
+    phrase = " ".join(part for part in [amount, kind] if part)
+    if reset:
+        phrase = f"{phrase}; resets {reset}" if phrase else f"resets {reset}"
+    if context:
+        phrase = f"{phrase} ({context})" if phrase else context
+    return phrase
+
+
+def _summary(values: list[dict[str, Any]], formatter: Any) -> str:
+    return "; ".join(text for value in values if (text := formatter(value)))
+
+
 def _export_row(item: MagicItem) -> dict[str, str]:
     data = item.model_dump(mode="json")
     mechanics = data.get("mechanics", {})
+    bonuses = mechanics.get("bonuses", [])
+    defenses = mechanics.get("defenses", [])
+    usage_limits = mechanics.get("usage_limits", [])
     return {
         "id": data["id"],
         "name": data["name"],
@@ -1366,18 +1413,68 @@ def _export_row(item: MagicItem) -> dict[str, str]:
         "source_pages": _join_list(data.get("source_pages", [])),
         "description": data["description"],
         "equipment_slots": _join_list(mechanics.get("equipment_slots", [])),
-        "bonuses": _compact_json(mechanics.get("bonuses", [])),
+        "bonus_summary": _summary(bonuses, _format_bonus),
+        "bonuses": _compact_json(bonuses),
         "damage_types": _join_list(mechanics.get("damage_types", [])),
-        "defenses": _compact_json(mechanics.get("defenses", [])),
+        "defense_summary": _summary(defenses, _format_defense),
+        "defenses": _compact_json(defenses),
         "spells_granted": _join_list(mechanics.get("spells_granted", [])),
         "conditions_inflicted": _join_list(mechanics.get("conditions_inflicted", [])),
         "target_creatures": _join_list(mechanics.get("target_creatures", [])),
         "environment_tags": _join_list(mechanics.get("environment_tags", [])),
-        "usage_limits": _compact_json(mechanics.get("usage_limits", [])),
+        "usage_limit_summary": _summary(usage_limits, _format_usage_limit),
+        "usage_limits": _compact_json(usage_limits),
         "action_economy": _join_list(mechanics.get("action_economy", [])),
         "warnings": _join_list(data.get("warnings", [])),
         "data_json": _compact_json(data),
     }
+
+
+def _detail_rows(items: list[MagicItem]) -> tuple[
+    list[dict[str, str]],
+    list[dict[str, str]],
+    list[dict[str, str]],
+]:
+    bonus_rows: list[dict[str, str]] = []
+    defense_rows: list[dict[str, str]] = []
+    usage_limit_rows: list[dict[str, str]] = []
+    for item in items:
+        data = item.model_dump(mode="json")
+        mechanics = data.get("mechanics", {})
+        item_id = data["id"]
+        item_name = data["name"]
+        for bonus in mechanics.get("bonuses", []):
+            bonus_rows.append(
+                {
+                    "item_id": item_id,
+                    "item_name": item_name,
+                    "target": str(bonus.get("target") or ""),
+                    "value": str(bonus.get("value") or ""),
+                    "context": str(bonus.get("context") or ""),
+                }
+            )
+        for defense in mechanics.get("defenses", []):
+            defense_rows.append(
+                {
+                    "item_id": item_id,
+                    "item_name": item_name,
+                    "kind": str(defense.get("kind") or ""),
+                    "target": str(defense.get("target") or ""),
+                    "context": str(defense.get("context") or ""),
+                }
+            )
+        for usage_limit in mechanics.get("usage_limits", []):
+            usage_limit_rows.append(
+                {
+                    "item_id": item_id,
+                    "item_name": item_name,
+                    "kind": str(usage_limit.get("kind") or ""),
+                    "amount": str(usage_limit.get("amount") or ""),
+                    "reset": str(usage_limit.get("reset") or ""),
+                    "context": str(usage_limit.get("context") or ""),
+                }
+            )
+    return bonus_rows, defense_rows, usage_limit_rows
 
 
 def _sql_literal(value: str | None) -> str:
@@ -1412,13 +1509,29 @@ def export_items(paths: Paths) -> None:
     ensure_dir(paths.work_dir)
 
     rows = [_export_row(item) for item in items]
+    bonus_rows, defense_rows, usage_limit_rows = _detail_rows(items)
     csv_path = paths.work_dir / "magic_items.csv"
     sql_path = paths.work_dir / "magic_items.sql"
+    bonuses_csv_path = paths.work_dir / "magic_item_bonuses.csv"
+    defenses_csv_path = paths.work_dir / "magic_item_defenses.csv"
+    usage_limits_csv_path = paths.work_dir / "magic_item_usage_limits.csv"
 
     with csv_path.open("w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=EXPORT_COLUMNS)
         writer.writeheader()
         writer.writerows(rows)
+    with bonuses_csv_path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=BONUS_EXPORT_COLUMNS)
+        writer.writeheader()
+        writer.writerows(bonus_rows)
+    with defenses_csv_path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=DEFENSE_EXPORT_COLUMNS)
+        writer.writeheader()
+        writer.writerows(defense_rows)
+    with usage_limits_csv_path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=USAGE_LIMIT_EXPORT_COLUMNS)
+        writer.writeheader()
+        writer.writerows(usage_limit_rows)
 
     sql_columns = [
         "id",
@@ -1433,13 +1546,16 @@ def export_items(paths: Paths) -> None:
         "source_pages",
         "description",
         "equipment_slots",
+        "bonus_summary",
         "bonuses",
         "damage_types",
+        "defense_summary",
         "defenses",
         "spells_granted",
         "conditions_inflicted",
         "target_creatures",
         "environment_tags",
+        "usage_limit_summary",
         "usage_limits",
         "action_economy",
         "warnings",
@@ -1461,13 +1577,16 @@ def export_items(paths: Paths) -> None:
         "    source_pages integer[] not null,",
         "    description text not null,",
         "    equipment_slots text not null,",
+        "    bonus_summary text not null,",
         "    bonuses jsonb not null,",
         "    damage_types text not null,",
+        "    defense_summary text not null,",
         "    defenses jsonb not null,",
         "    spells_granted text not null,",
         "    conditions_inflicted text not null,",
         "    target_creatures text not null,",
         "    environment_tags text not null,",
+        "    usage_limit_summary text not null,",
         "    usage_limits jsonb not null,",
         "    action_economy text not null,",
         "    warnings text not null,",
@@ -1497,13 +1616,16 @@ def export_items(paths: Paths) -> None:
                         _sql_int_array(row["source_pages"]),
                         _sql_literal(row["description"]),
                         _sql_literal(row["equipment_slots"]),
+                        _sql_literal(row["bonus_summary"]),
                         _sql_jsonb(row["bonuses"]),
                         _sql_literal(row["damage_types"]),
+                        _sql_literal(row["defense_summary"]),
                         _sql_jsonb(row["defenses"]),
                         _sql_literal(row["spells_granted"]),
                         _sql_literal(row["conditions_inflicted"]),
                         _sql_literal(row["target_creatures"]),
                         _sql_literal(row["environment_tags"]),
+                        _sql_literal(row["usage_limit_summary"]),
                         _sql_jsonb(row["usage_limits"]),
                         _sql_literal(row["action_economy"]),
                         _sql_literal(row["warnings"]),
@@ -1516,6 +1638,9 @@ def export_items(paths: Paths) -> None:
     sql_path.write_text("\n".join(sql_lines) + "\n", encoding="utf-8")
 
     print(f"export: wrote {len(rows)} CSV rows to {csv_path}")
+    print(f"export: wrote {len(bonus_rows)} bonus rows to {bonuses_csv_path}")
+    print(f"export: wrote {len(defense_rows)} defense rows to {defenses_csv_path}")
+    print(f"export: wrote {len(usage_limit_rows)} usage-limit rows to {usage_limits_csv_path}")
     print(f"export: wrote {len(rows)} SQL rows to {sql_path}")
     if enrichment_errors:
         print(f"export: warning - {len(enrichment_errors)} enrichment errors are recorded")

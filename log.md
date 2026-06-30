@@ -36,6 +36,9 @@
   required fields, OCR provenance, table existence, and zero extraction errors.
 - Added `export` stage to write reviewer-friendly `magic_items.csv` and
   `magic_items.sql` files from the validated enriched ontology artifact.
+- Added readable CSV summaries plus separate bonus, defense, and usage-limit
+  detail exports so nested mechanics can be reviewed without reading JSON
+  arrays inside spreadsheet cells.
 - Added optional `--workers` support for expensive stages. Rendering runs pages
   concurrently at the requested DPI, page extraction uses a parallel first pass
   plus sequential context repair for continuation/error-sensitive pages, and

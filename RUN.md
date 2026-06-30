@@ -161,13 +161,16 @@ item before recording an enrichment error.
 Generated artifacts are written under `data/extracted_fresh/`.
 
 ```text
-page_images/          rendered PNG pages
-ocr/                  Tesseract OCR helper text
-vlm_pages/            raw per-page Gemini extraction records
-items_source.json     merged and Pydantic-validated source item records
-items_enriched.json   final ontology records with semantic mechanics tags
-magic_items.csv       flat export for spreadsheet/review workflows
-magic_items.sql       standalone Postgres import for magic_item_export
+page_images/                 rendered PNG pages
+ocr/                         Tesseract OCR helper text
+vlm_pages/                   raw per-page Gemini extraction records
+items_source.json            merged and Pydantic-validated source item records
+items_enriched.json          final ontology records with semantic mechanics tags
+magic_items.csv              flat export for spreadsheet/review workflows
+magic_items.sql              standalone Postgres import for magic_item_export
+magic_item_bonuses.csv       one row per extracted bonus
+magic_item_defenses.csv      one row per extracted defense
+magic_item_usage_limits.csv  one row per extracted usage limit
 ```
 
 These files are intentionally kept outside the database so extraction can be
@@ -179,10 +182,15 @@ Complete page-level OCR text is preserved in `ocr/` artifacts and in the
 
 The export stage writes two reviewer-friendly result files:
 
-- `magic_items.csv` flattens the catalog into sortable columns while retaining
-  the full ontology record in `data_json`.
+- `magic_items.csv` flattens the catalog into sortable columns, adds readable
+  summary columns for nested effects, and retains the full ontology record in
+  `data_json`.
+- `magic_item_bonuses.csv`, `magic_item_defenses.csv`, and
+  `magic_item_usage_limits.csv` split nested effect records into one row per
+  effect for easier spreadsheet filtering.
 - `magic_items.sql` creates and populates a standalone `magic_item_export`
-  table with the same flattened columns plus full JSONB data.
+  table with the same flattened columns, readable summaries, and full JSONB
+  data.
 
 ## 5. Database Tables
 
