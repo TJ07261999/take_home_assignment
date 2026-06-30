@@ -22,6 +22,7 @@ import os
 import re
 import socket
 import shutil
+import sqlite3
 import subprocess
 import sys
 import time
@@ -1502,6 +1503,240 @@ def _sql_jsonb(value: str) -> str:
     return _sql_literal(value) + "::jsonb"
 
 
+def _sqlite_bool(value: str) -> int:
+    return 1 if value == "true" else 0
+
+
+def _sqlite_optional(value: str) -> str | None:
+    return value or None
+
+
+def export_sqlite(
+    paths: Paths,
+    item_rows: list[dict[str, str]],
+    bonus_rows: list[dict[str, str]],
+    defense_rows: list[dict[str, str]],
+    usage_limit_rows: list[dict[str, str]],
+) -> Path:
+    sqlite_path = paths.work_dir / "reznar_exports.sqlite"
+    if sqlite_path.exists():
+        sqlite_path.unlink()
+
+    with sqlite3.connect(sqlite_path) as conn:
+        conn.execute("pragma foreign_keys = on")
+        conn.executescript(
+            """
+            create table magic_items (
+                id text primary key,
+                name text not null,
+                item_kind text not null,
+                subtype text,
+                rarity text not null,
+                requires_attunement integer not null,
+                attunement_requirement text,
+                is_cursed integer not null,
+                printed_type_line text not null,
+                source_pages text not null,
+                description text not null,
+                equipment_slots text,
+                bonus_summary text,
+                bonuses_json text not null,
+                damage_types text,
+                defense_summary text,
+                defenses_json text not null,
+                spells_granted text,
+                conditions_inflicted text,
+                target_creatures text,
+                environment_tags text,
+                usage_limit_summary text,
+                usage_limits_json text not null,
+                action_economy text,
+                warnings text,
+                data_json text not null
+            );
+
+            create table item_bonuses (
+                id integer primary key autoincrement,
+                item_id text not null references magic_items(id) on delete cascade,
+                item_name text not null,
+                target text,
+                value text,
+                context text
+            );
+
+            create table item_defenses (
+                id integer primary key autoincrement,
+                item_id text not null references magic_items(id) on delete cascade,
+                item_name text not null,
+                kind text,
+                target text,
+                context text
+            );
+
+            create table item_usage_limits (
+                id integer primary key autoincrement,
+                item_id text not null references magic_items(id) on delete cascade,
+                item_name text not null,
+                kind text,
+                amount text,
+                reset text,
+                context text
+            );
+
+            create index magic_items_kind_idx on magic_items(item_kind);
+            create index magic_items_rarity_idx on magic_items(rarity);
+            create index magic_items_attunement_idx on magic_items(requires_attunement);
+            create index item_bonuses_item_id_idx on item_bonuses(item_id);
+            create index item_bonuses_target_idx on item_bonuses(target);
+            create index item_defenses_item_id_idx on item_defenses(item_id);
+            create index item_defenses_kind_target_idx on item_defenses(kind, target);
+            create index item_usage_limits_item_id_idx on item_usage_limits(item_id);
+            create index item_usage_limits_kind_idx on item_usage_limits(kind);
+
+            create view item_overview as
+            select
+                name,
+                item_kind,
+                rarity,
+                case requires_attunement when 1 then 'yes' else 'no' end
+                    as requires_attunement,
+                source_pages,
+                equipment_slots,
+                bonus_summary,
+                defense_summary,
+                usage_limit_summary,
+                spells_granted,
+                damage_types,
+                description
+            from magic_items
+            order by name;
+
+            create view items_with_bonuses as
+            select
+                m.name,
+                m.item_kind,
+                m.rarity,
+                b.target,
+                b.value,
+                b.context,
+                m.source_pages
+            from item_bonuses b
+            join magic_items m on m.id = b.item_id
+            order by m.name, b.target, b.value;
+
+            create view items_with_defenses as
+            select
+                m.name,
+                m.item_kind,
+                m.rarity,
+                d.kind,
+                d.target,
+                d.context,
+                m.source_pages
+            from item_defenses d
+            join magic_items m on m.id = d.item_id
+            order by m.name, d.kind, d.target;
+            """
+        )
+
+        conn.executemany(
+            """
+            insert into magic_items (
+                id, name, item_kind, subtype, rarity, requires_attunement,
+                attunement_requirement, is_cursed, printed_type_line,
+                source_pages, description, equipment_slots, bonus_summary,
+                bonuses_json, damage_types, defense_summary, defenses_json,
+                spells_granted, conditions_inflicted, target_creatures,
+                environment_tags, usage_limit_summary, usage_limits_json,
+                action_economy, warnings, data_json
+            )
+            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    row["id"],
+                    row["name"],
+                    row["item_kind"],
+                    _sqlite_optional(row["subtype"]),
+                    row["rarity"],
+                    _sqlite_bool(row["requires_attunement"]),
+                    _sqlite_optional(row["attunement_requirement"]),
+                    _sqlite_bool(row["is_cursed"]),
+                    row["printed_type_line"],
+                    row["source_pages"],
+                    row["description"],
+                    row["equipment_slots"],
+                    row["bonus_summary"],
+                    row["bonuses"],
+                    row["damage_types"],
+                    row["defense_summary"],
+                    row["defenses"],
+                    row["spells_granted"],
+                    row["conditions_inflicted"],
+                    row["target_creatures"],
+                    row["environment_tags"],
+                    row["usage_limit_summary"],
+                    row["usage_limits"],
+                    row["action_economy"],
+                    row["warnings"],
+                    row["data_json"],
+                )
+                for row in item_rows
+            ],
+        )
+        conn.executemany(
+            """
+            insert into item_bonuses (item_id, item_name, target, value, context)
+            values (?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    row["item_id"],
+                    row["item_name"],
+                    _sqlite_optional(row["target"]),
+                    _sqlite_optional(row["value"]),
+                    _sqlite_optional(row["context"]),
+                )
+                for row in bonus_rows
+            ],
+        )
+        conn.executemany(
+            """
+            insert into item_defenses (item_id, item_name, kind, target, context)
+            values (?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    row["item_id"],
+                    row["item_name"],
+                    _sqlite_optional(row["kind"]),
+                    _sqlite_optional(row["target"]),
+                    _sqlite_optional(row["context"]),
+                )
+                for row in defense_rows
+            ],
+        )
+        conn.executemany(
+            """
+            insert into item_usage_limits (item_id, item_name, kind, amount, reset, context)
+            values (?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    row["item_id"],
+                    row["item_name"],
+                    _sqlite_optional(row["kind"]),
+                    _sqlite_optional(row["amount"]),
+                    _sqlite_optional(row["reset"]),
+                    _sqlite_optional(row["context"]),
+                )
+                for row in usage_limit_rows
+            ],
+        )
+        conn.commit()
+    return sqlite_path
+
+
 def export_items(paths: Paths) -> None:
     if not paths.enriched_items.exists():
         raise SystemExit("Run the enrich stage before export.")
@@ -1637,11 +1872,20 @@ def export_items(paths: Paths) -> None:
         sql_lines.append(",\n".join(values) + ";")
     sql_path.write_text("\n".join(sql_lines) + "\n", encoding="utf-8")
 
+    sqlite_path = export_sqlite(
+        paths,
+        item_rows=rows,
+        bonus_rows=bonus_rows,
+        defense_rows=defense_rows,
+        usage_limit_rows=usage_limit_rows,
+    )
+
     print(f"export: wrote {len(rows)} CSV rows to {csv_path}")
     print(f"export: wrote {len(bonus_rows)} bonus rows to {bonuses_csv_path}")
     print(f"export: wrote {len(defense_rows)} defense rows to {defenses_csv_path}")
     print(f"export: wrote {len(usage_limit_rows)} usage-limit rows to {usage_limits_csv_path}")
     print(f"export: wrote {len(rows)} SQL rows to {sql_path}")
+    print(f"export: wrote SQLite database to {sqlite_path}")
     if enrichment_errors:
         print(f"export: warning - {len(enrichment_errors)} enrichment errors are recorded")
 

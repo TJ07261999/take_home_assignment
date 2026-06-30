@@ -39,6 +39,8 @@
 - Added readable CSV summaries plus separate bonus, defense, and usage-limit
   detail exports so nested mechanics can be reviewed without reading JSON
   arrays inside spreadsheet cells.
+- Added `reznar_exports.sqlite` so the same export can be opened directly in
+  DB Browser for SQLite as relational tables and readable item/effect views.
 - Added optional `--workers` support for expensive stages. Rendering runs pages
   concurrently at the requested DPI, page extraction uses a parallel first pass
   plus sequential context repair for continuation/error-sensitive pages, and

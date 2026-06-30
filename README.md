@@ -59,8 +59,9 @@ Pipeline quality controls:
   at the requested DPI, page extraction runs a parallel first pass with
   sequential context repair for continuation/error-sensitive pages, and
   enrichment tags independent items in parallel.
-- The export stage writes `magic_items.csv` and `magic_items.sql` for review
-  workflows that prefer files over a live local database.
+- The export stage writes `magic_items.csv`, `magic_items.sql`, and
+  `reznar_exports.sqlite` for review workflows that prefer files over a live
+  local database.
 - The CSV export includes readable summaries and separate bonus/defense/usage
   limit detail files so nested ontology fields are easier to inspect.
 - `uv run python -m reznar.pipeline validate --work-dir data/extracted_fresh`

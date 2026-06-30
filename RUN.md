@@ -168,6 +168,7 @@ items_source.json            merged and Pydantic-validated source item records
 items_enriched.json          final ontology records with semantic mechanics tags
 magic_items.csv              flat export for spreadsheet/review workflows
 magic_items.sql              standalone Postgres import for magic_item_export
+reznar_exports.sqlite        relational DB Browser for SQLite export
 magic_item_bonuses.csv       one row per extracted bonus
 magic_item_defenses.csv      one row per extracted defense
 magic_item_usage_limits.csv  one row per extracted usage limit
@@ -180,7 +181,7 @@ The item `description` fields are concise non-verbatim mechanics summaries.
 Complete page-level OCR text is preserved in `ocr/` artifacts and in the
 `extraction_page.ocr_text` database column.
 
-The export stage writes two reviewer-friendly result files:
+The export stage writes reviewer-friendly result files:
 
 - `magic_items.csv` flattens the catalog into sortable columns, adds readable
   summary columns for nested effects, and retains the full ontology record in
@@ -191,6 +192,10 @@ The export stage writes two reviewer-friendly result files:
 - `magic_items.sql` creates and populates a standalone `magic_item_export`
   table with the same flattened columns, readable summaries, and full JSONB
   data.
+- `reznar_exports.sqlite` creates the same results as a relational SQLite
+  database for DB Browser, including `magic_items`, `item_bonuses`,
+  `item_defenses`, `item_usage_limits`, and readable views such as
+  `item_overview`, `items_with_bonuses`, and `items_with_defenses`.
 
 ## 5. Database Tables
 
